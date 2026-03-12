@@ -19,6 +19,7 @@
 #   F / f         - Fill tool toggle
 #   L / l         - Line tool toggle
 #   B / b         - Box tool toggle
+#   I / i         - Ellipse/oval tool (center + edge)
 #   E / e         - Eraser toggle
 #   C / c         - Copy mode
 #   V / v         - Paste
@@ -54,12 +55,14 @@ CUR_BLINK=0
 DRAW_CHARS=(' ' '#' '@' '*' '.' ':' '=' '+' '-' '|' '/' '\\' '~' '%' '&' '$'
             '!' '?' '<' '>' '^' 'v' 'o' 'O' '0' 'X' 'x')
 DRAW_CHAR_IDX=1
-TOOL="draw"     # draw, fill, line, box, erase, copy
+TOOL="draw"     # draw, fill, line, box, ellipse, erase, copy
 GRID_ON=0
 LINE_START_X=-1
 LINE_START_Y=-1
 BOX_START_X=-1
 BOX_START_Y=-1
+ELLIPSE_START_X=-1
+ELLIPSE_START_Y=-1
 COPY_BUF=()
 COPY_W=0
 COPY_H=0
@@ -341,6 +344,71 @@ draw_box() {
     done
 }
 
+# Draw ellipse (midpoint algorithm)
+# First click = center, second click = edge point defining radii
+draw_ellipse() {
+    local cx=$1 cy=$2 ex=$3 ey=$4
+    snapshot_canvas
+
+    # Compute radii from center to edge point
+    local rx=$(( ex - cx ))
+    local ry=$(( ey - cy ))
+    (( rx < 0 )) && rx=$(( -rx ))
+    (( ry < 0 )) && ry=$(( -ry ))
+    (( rx == 0 )) && rx=1
+    (( ry == 0 )) && ry=1
+
+    # Midpoint ellipse algorithm
+    local x=0
+    local y=$ry
+    local rx2=$(( rx * rx ))
+    local ry2=$(( ry * ry ))
+    local two_rx2=$(( 2 * rx2 ))
+    local two_ry2=$(( 2 * ry2 ))
+    local px=0
+    local py=$(( two_rx2 * y ))
+
+    # Plot 4 symmetric points
+    _ellipse_plot4() {
+        set_cell "$(( cx + $1 ))" "$(( cy + $2 ))" "$CUR_CHAR" "$CUR_FG" "$CUR_BG" "$CUR_BOLD" "$CUR_BLINK"
+        set_cell "$(( cx - $1 ))" "$(( cy + $2 ))" "$CUR_CHAR" "$CUR_FG" "$CUR_BG" "$CUR_BOLD" "$CUR_BLINK"
+        set_cell "$(( cx + $1 ))" "$(( cy - $2 ))" "$CUR_CHAR" "$CUR_FG" "$CUR_BG" "$CUR_BOLD" "$CUR_BLINK"
+        set_cell "$(( cx - $1 ))" "$(( cy - $2 ))" "$CUR_CHAR" "$CUR_FG" "$CUR_BG" "$CUR_BOLD" "$CUR_BLINK"
+    }
+
+    # Region 1: dy/dx < 1
+    local p=$(( ry2 - rx2 * ry + rx2 / 4 ))
+    while (( px < py )); do
+        _ellipse_plot4 "$x" "$y"
+        (( x++ ))
+        (( px += two_ry2 ))
+        if (( p < 0 )); then
+            (( p += ry2 + px ))
+        else
+            (( y-- ))
+            (( py -= two_rx2 ))
+            (( p += ry2 + px - py ))
+        fi
+    done
+
+    # Region 2: dy/dx >= 1
+    p=$(( ry2 * (2 * x + 1) * (2 * x + 1) / 4 + rx2 * (y - 1) * (y - 1) - rx2 * ry2 ))
+    while (( y >= 0 )); do
+        _ellipse_plot4 "$x" "$y"
+        (( y-- ))
+        (( py -= two_rx2 ))
+        if (( p > 0 )); then
+            (( p += rx2 - py ))
+        else
+            (( x++ ))
+            (( px += two_ry2 ))
+            (( p += rx2 - py + px ))
+        fi
+    done
+
+    unset -f _ellipse_plot4
+}
+
 # Copy region
 do_copy() {
     if (( COPY_START_X < 0 || COPY_END_X < 0 )); then return; fi
@@ -595,8 +663,9 @@ render_status_bar() {
         draw)  tool_name="DRAW"  ;;
         fill)  tool_name="FILL"  ;;
         line)  tool_name="LINE"  ;;
-        box)   tool_name="BOX"   ;;
-        erase) tool_name="ERASE" ;;
+        box)     tool_name="BOX"     ;;
+        ellipse) tool_name="ELLIPSE" ;;
+        erase)   tool_name="ERASE"   ;;
         copy)  tool_name="COPY"  ;;
         *)     tool_name="???"   ;;
     esac
@@ -669,7 +738,7 @@ render_status_bar() {
     printf "\e[${row};1H\e[0;90;40m"
     local mouse_flag="ON"
     (( ! MOUSE_ON )) && mouse_flag="OFF"
-    printf " [H]elp [Space]Draw [Tab]Char [1]FG [2]BG [F]ill [L]ine [B]ox [E]rase [U]ndo [S]ave [M]ouse:%s [Q]uit" "$mouse_flag"
+    printf " [H]elp [Space]Draw [Tab]Char [1]FG [2]BG [F]ill [L]ine [B]ox [I]ellipse [E]rase [U]ndo [S]ave [M]ouse:%s [Q]uit" "$mouse_flag"
     printf "%*s\e[0m" 10 ""
 }
 
@@ -828,6 +897,7 @@ show_help() {
     ║    F ............. Flood fill tool                           ║
     ║    L ............. Line tool (click start, move, click end)  ║
     ║    B ............. Box/rectangle tool                        ║
+    ║    I ............. Ellipse/oval tool (center, then edge)    ║
     ║    E ............. Eraser tool                               ║
     ║    C ............. Copy mode (select region)                 ║
     ║    V ............. Paste copied region                       ║
@@ -909,6 +979,15 @@ handle_mouse_action() {
                         else
                             draw_box "$BOX_START_X" "$BOX_START_Y" "$CUR_X" "$CUR_Y"
                             BOX_START_X=-1; BOX_START_Y=-1
+                        fi
+                        ;;
+                    ellipse)
+                        if (( ELLIPSE_START_X < 0 )); then
+                            ELLIPSE_START_X=$CUR_X
+                            ELLIPSE_START_Y=$CUR_Y
+                        else
+                            draw_ellipse "$ELLIPSE_START_X" "$ELLIPSE_START_Y" "$CUR_X" "$CUR_Y"
+                            ELLIPSE_START_X=-1; ELLIPSE_START_Y=-1
                         fi
                         ;;
                     erase)
@@ -1191,6 +1270,16 @@ handle_input() {
                         BOX_START_Y=-1
                     fi
                     ;;
+                ellipse)
+                    if (( ELLIPSE_START_X < 0 )); then
+                        ELLIPSE_START_X=$CUR_X
+                        ELLIPSE_START_Y=$CUR_Y
+                    else
+                        draw_ellipse "$ELLIPSE_START_X" "$ELLIPSE_START_Y" "$CUR_X" "$CUR_Y"
+                        ELLIPSE_START_X=-1
+                        ELLIPSE_START_Y=-1
+                    fi
+                    ;;
                 erase)
                     erase_at_cursor
                     ;;
@@ -1251,23 +1340,27 @@ handle_input() {
         [rR]|CTRL_Y) do_redo ;;
         [fF])
             TOOL="fill"
-            LINE_START_X=-1; BOX_START_X=-1; SELECTING=0
+            LINE_START_X=-1; BOX_START_X=-1; ELLIPSE_START_X=-1; SELECTING=0
             ;;
         [lL])
             TOOL="line"
-            LINE_START_X=-1; BOX_START_X=-1; SELECTING=0
+            LINE_START_X=-1; BOX_START_X=-1; ELLIPSE_START_X=-1; SELECTING=0
             ;;
         [bB])
             TOOL="box"
-            LINE_START_X=-1; BOX_START_X=-1; SELECTING=0
+            LINE_START_X=-1; BOX_START_X=-1; ELLIPSE_START_X=-1; SELECTING=0
+            ;;
+        [iI])
+            TOOL="ellipse"
+            LINE_START_X=-1; BOX_START_X=-1; ELLIPSE_START_X=-1; SELECTING=0
             ;;
         [eE])
             TOOL="erase"
-            LINE_START_X=-1; BOX_START_X=-1; SELECTING=0
+            LINE_START_X=-1; BOX_START_X=-1; ELLIPSE_START_X=-1; SELECTING=0
             ;;
         [cC])
             TOOL="copy"
-            LINE_START_X=-1; BOX_START_X=-1; SELECTING=0
+            LINE_START_X=-1; BOX_START_X=-1; ELLIPSE_START_X=-1; SELECTING=0
             COPY_START_X=-1; COPY_END_X=-1
             ;;
         [vV])
@@ -1275,7 +1368,7 @@ handle_input() {
             ;;
         [dD])
             TOOL="draw"
-            LINE_START_X=-1; BOX_START_X=-1; SELECTING=0
+            LINE_START_X=-1; BOX_START_X=-1; ELLIPSE_START_X=-1; SELECTING=0
             ;;
         [pP])
             # Eyedropper - pick color from current cell
