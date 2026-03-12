@@ -25,6 +25,11 @@
 #   P / p         - Eyedropper/pick color from canvas
 #   G / g         - Toggle grid overlay
 #   + / -         - Resize canvas
+#   Mouse LClick  - Move cursor & activate tool
+#   Mouse RClick  - Eyedropper (pick color)
+#   Mouse Drag    - Draw/erase while dragging
+#   Mouse Wheel   - Scroll cursor up/down
+#   M / m         - Toggle mouse on/off
 #   H / h / ?     - Help screen
 #   Q / q         - Quit
 # ============================================================================
@@ -63,6 +68,9 @@ COPY_START_Y=-1
 COPY_END_X=-1
 COPY_END_Y=-1
 SELECTING=0
+MOUSE_ON=1          # Mouse enabled by default
+MOUSE_DRAGGING=0    # Currently dragging
+MOUSE_BTN=-1        # Last mouse button pressed
 
 # Color names for display
 COLOR_NAMES=("Black" "Red" "Green" "Yellow" "Blue" "Magenta" "Cyan" "White"
@@ -85,14 +93,30 @@ REDO_COUNT=0
 # ============================================================================
 # Terminal setup
 # ============================================================================
+enable_mouse() {
+    printf '\e[?1000h'     # Enable basic mouse tracking (clicks)
+    printf '\e[?1002h'     # Enable button-event tracking (drag)
+    printf '\e[?1006h'     # Enable SGR extended mouse mode (supports >223 cols)
+}
+
+disable_mouse() {
+    printf '\e[?1006l'
+    printf '\e[?1002l'
+    printf '\e[?1000l'
+}
+
 setup_terminal() {
     stty -echo -icanon min 1 time 0 2>/dev/null
     printf '\e[?25l'       # Hide cursor
     printf '\e[?1049h'     # Alternate screen buffer
     printf '\e[2J'         # Clear screen
+    if (( MOUSE_ON )); then
+        enable_mouse
+    fi
 }
 
 restore_terminal() {
+    disable_mouse
     printf '\e[0m'
     printf '\e[?25h'       # Show cursor
     printf '\e[?1049l'     # Restore screen buffer
@@ -393,7 +417,7 @@ save_file() {
         done
         out+="\e[0m\n"
     done
-    printf "$out" > "$fname"
+    printf '%b' "$out" > "$fname"
     MODIFIED=0
     FILENAME="$fname"
 }
@@ -555,7 +579,7 @@ render_canvas() {
         fi
     done
 
-    printf "$buf"
+    printf '%b' "$buf"
 }
 
 render_status_bar() {
@@ -643,7 +667,9 @@ render_status_bar() {
     # Status bar line 3 - help hint
     (( row++ ))
     printf "\e[${row};1H\e[0;90;40m"
-    printf " [H]elp [Space]Draw [Tab]Char [1]FG [2]BG [F]ill [L]ine [B]ox [E]rase [U]ndo [S]ave [Q]uit"
+    local mouse_flag="ON"
+    (( ! MOUSE_ON )) && mouse_flag="OFF"
+    printf " [H]elp [Space]Draw [Tab]Char [1]FG [2]BG [F]ill [L]ine [B]ox [E]rase [U]ndo [S]ave [M]ouse:%s [Q]uit" "$mouse_flag"
     printf "%*s\e[0m" 10 ""
 }
 
@@ -812,6 +838,15 @@ show_help() {
     ║    O / Ctrl+O .... Open/load file                           ║
     ║    N / Ctrl+N .... New canvas                               ║
     ║                                                              ║
+    ║  MOUSE                                                       ║
+    ║    Left click ... Move cursor & activate current tool       ║
+    ║    Left drag .... Draw/erase continuously                   ║
+    ║    Right click .. Eyedropper (pick color from cell)         ║
+    ║    Middle click . Paste clipboard at position               ║
+    ║    Scroll wheel . Move cursor up/down                       ║
+    ║    Click palette  Select FG/BG color from status bar        ║
+    ║    M ............. Toggle mouse on/off                       ║
+    ║                                                              ║
     ║  OTHER                                                       ║
     ║    U / Ctrl+Z .... Undo                                     ║
     ║    R / Ctrl+Y .... Redo                                     ║
@@ -825,6 +860,141 @@ show_help() {
 HELPEOF
     printf '\e[0m'
     IFS= read -rsn1
+}
+
+# ============================================================================
+# Mouse handling
+# ============================================================================
+# Handle mouse action at canvas coordinates
+handle_mouse_action() {
+    local mx=$1 my=$2 btn=$3 event=$4  # event: press, release, drag, wheel_up, wheel_down
+
+    # Ignore clicks outside the canvas area
+    if (( mx < 0 || mx >= CANVAS_W || my < 0 || my >= CANVAS_H )); then
+        # Check if click is on the color palette (status bar line 2)
+        local palette_row=$(( CANVAS_H + 1 ))  # 0-indexed row for palette
+        if (( my == palette_row )); then
+            handle_palette_click "$mx"
+        fi
+        return
+    fi
+
+    case "$event" in
+        press)
+            if (( btn == 0 )); then
+                # Left click - move cursor and activate tool
+                CUR_X=$mx
+                CUR_Y=$my
+                case "$TOOL" in
+                    draw)
+                        MOUSE_DRAGGING=1
+                        draw_at_cursor
+                        ;;
+                    fill)
+                        flood_fill "$CUR_X" "$CUR_Y"
+                        ;;
+                    line)
+                        if (( LINE_START_X < 0 )); then
+                            LINE_START_X=$CUR_X
+                            LINE_START_Y=$CUR_Y
+                        else
+                            draw_line "$LINE_START_X" "$LINE_START_Y" "$CUR_X" "$CUR_Y"
+                            LINE_START_X=-1; LINE_START_Y=-1
+                        fi
+                        ;;
+                    box)
+                        if (( BOX_START_X < 0 )); then
+                            BOX_START_X=$CUR_X
+                            BOX_START_Y=$CUR_Y
+                        else
+                            draw_box "$BOX_START_X" "$BOX_START_Y" "$CUR_X" "$CUR_Y"
+                            BOX_START_X=-1; BOX_START_Y=-1
+                        fi
+                        ;;
+                    erase)
+                        MOUSE_DRAGGING=1
+                        erase_at_cursor
+                        ;;
+                    copy)
+                        if (( ! SELECTING )); then
+                            COPY_START_X=$CUR_X
+                            COPY_START_Y=$CUR_Y
+                            SELECTING=1
+                        else
+                            COPY_END_X=$CUR_X
+                            COPY_END_Y=$CUR_Y
+                            do_copy
+                            SELECTING=0
+                        fi
+                        ;;
+                esac
+            elif (( btn == 2 )); then
+                # Right click - eyedropper
+                CUR_X=$mx
+                CUR_Y=$my
+                local idx=$(( CUR_X + CUR_Y * CANVAS_W ))
+                CUR_FG=${CANVAS_FG[$idx]}
+                CUR_BG=${CANVAS_BG[$idx]}
+                CUR_BOLD=${CANVAS_BOLD[$idx]}
+                CUR_BLINK=${CANVAS_BLINK[$idx]}
+                local cell_ch="${CANVAS_CHAR[$idx]}"
+                if [[ "$cell_ch" != " " ]]; then
+                    CUR_CHAR="$cell_ch"
+                fi
+            elif (( btn == 1 )); then
+                # Middle click - paste
+                CUR_X=$mx
+                CUR_Y=$my
+                do_paste
+            fi
+            ;;
+        drag)
+            if (( btn == 0 && MOUSE_DRAGGING )); then
+                CUR_X=$mx
+                CUR_Y=$my
+                case "$TOOL" in
+                    draw)
+                        # Draw without snapshotting every cell during drag
+                        set_cell "$CUR_X" "$CUR_Y" "$CUR_CHAR" "$CUR_FG" "$CUR_BG" "$CUR_BOLD" "$CUR_BLINK"
+                        ;;
+                    erase)
+                        set_cell "$CUR_X" "$CUR_Y" " " 7 0 0 0
+                        ;;
+                esac
+            elif (( btn == 0 )); then
+                # Move cursor during selection/line/box preview
+                CUR_X=$mx
+                CUR_Y=$my
+            fi
+            ;;
+        release)
+            MOUSE_DRAGGING=0
+            ;;
+        wheel_up)
+            (( CUR_Y > 0 )) && (( CUR_Y-- ))
+            ;;
+        wheel_down)
+            (( CUR_Y < CANVAS_H - 1 )) && (( CUR_Y++ ))
+            ;;
+    esac
+}
+
+# Handle clicks on the color palette in the status bar
+handle_palette_click() {
+    local mx=$1
+    # FG palette starts at column 5, each color is 3 chars wide
+    # " FG: " = 5 chars, then 16 colors * 3 = 48, then "  BG: " = 6 chars
+    if (( mx >= 5 && mx < 53 )); then
+        local color_idx=$(( (mx - 5) / 3 ))
+        if (( color_idx >= 0 && color_idx < 16 )); then
+            CUR_FG=$color_idx
+        fi
+    elif (( mx >= 59 && mx < 107 )); then
+        local color_idx=$(( (mx - 59) / 3 ))
+        if (( color_idx >= 0 && color_idx < 16 )); then
+            CUR_BG=$color_idx
+        fi
+    fi
 }
 
 # ============================================================================
@@ -844,6 +1014,38 @@ read_key() {
         if [[ "$seq" == "[" ]]; then
             IFS= read -rsn1 -t 0.1 seq
             case "$seq" in
+                '<')
+                    # SGR mouse event: \e[<btn;col;row[Mm]
+                    local mouse_seq=""
+                    while IFS= read -rsn1 -t 0.1 mch; do
+                        if [[ "$mch" == "M" || "$mch" == "m" ]]; then
+                            # Parse: btn;col;row
+                            IFS=';' read -r mbtn mcol mrow <<< "$mouse_seq"
+                            local mx=$(( mcol - 1 ))  # 0-indexed
+                            local my=$(( mrow - 1 ))
+                            local base_btn=$(( mbtn & 3 ))
+                            local is_drag=$(( (mbtn >> 5) & 1 ))
+                            local is_wheel=$(( (mbtn >> 6) & 1 ))
+
+                            if (( is_wheel )); then
+                                if (( base_btn == 0 )); then
+                                    echo "MOUSE_WHEEL_UP $mx $my"
+                                else
+                                    echo "MOUSE_WHEEL_DOWN $mx $my"
+                                fi
+                            elif [[ "$mch" == "m" ]]; then
+                                echo "MOUSE_RELEASE $mx $my $base_btn"
+                            elif (( is_drag )); then
+                                echo "MOUSE_DRAG $mx $my $base_btn"
+                            else
+                                echo "MOUSE_PRESS $mx $my $base_btn"
+                            fi
+                            return
+                        fi
+                        mouse_seq+="$mch"
+                    done
+                    echo "UNKNOWN"
+                    ;;
                 A) echo "UP" ;;
                 B) echo "DOWN" ;;
                 C) echo "RIGHT" ;;
@@ -906,6 +1108,35 @@ read_key() {
 handle_input() {
     local key
     key=$(read_key)
+
+    # Handle mouse events first
+    case "$key" in
+        MOUSE_PRESS*)
+            read -r _ mx my btn <<< "$key"
+            handle_mouse_action "$mx" "$my" "$btn" "press"
+            return
+            ;;
+        MOUSE_RELEASE*)
+            read -r _ mx my btn <<< "$key"
+            handle_mouse_action "$mx" "$my" "$btn" "release"
+            return
+            ;;
+        MOUSE_DRAG*)
+            read -r _ mx my btn <<< "$key"
+            handle_mouse_action "$mx" "$my" "$btn" "drag"
+            return
+            ;;
+        MOUSE_WHEEL_UP*)
+            read -r _ mx my <<< "$key"
+            handle_mouse_action "$mx" "$my" 0 "wheel_up"
+            return
+            ;;
+        MOUSE_WHEEL_DOWN*)
+            read -r _ mx my <<< "$key"
+            handle_mouse_action "$mx" "$my" 0 "wheel_down"
+            return
+            ;;
+    esac
 
     case "$key" in
         UP)
@@ -1060,6 +1291,14 @@ handle_input() {
             ;;
         [gG])
             GRID_ON=$(( 1 - GRID_ON ))
+            ;;
+        [mM])
+            MOUSE_ON=$(( 1 - MOUSE_ON ))
+            if (( MOUSE_ON )); then
+                enable_mouse
+            else
+                disable_mouse
+            fi
             ;;
         [hH]|"?")
             show_help
