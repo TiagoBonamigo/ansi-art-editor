@@ -18,6 +18,7 @@
 #   Ctrl+Y / R    - Redo
 #   F / f         - Fill tool toggle
 #   L / l         - Line tool toggle
+#   K / k         - Polyline/continuous line tool
 #   B / b         - Box tool toggle
 #   I / i         - Ellipse/oval tool (center + edge)
 #   E / e         - Eraser toggle
@@ -38,11 +39,19 @@
 set -u
 
 # --- Configuration ---
-CANVAS_W=80
-CANVAS_H=24
-MAX_UNDO=100
+CANVAS_W=200
+CANVAS_H=200
+MAX_UNDO=50
 FILENAME="untitled.ans"
 MODIFIED=0
+
+# --- Viewport ---
+# The viewport is the visible portion of the canvas, sized to fit the terminal.
+# VIEWPORT_W/H are computed at startup from terminal size.
+VIEWPORT_W=78       # Leave 2 cols for right scrollbar
+VIEWPORT_H=22       # Leave rows for status bars
+SCROLL_X=0
+SCROLL_Y=0
 
 # --- State ---
 CUR_X=0
@@ -55,10 +64,12 @@ CUR_BLINK=0
 DRAW_CHARS=(' ' '#' '@' '*' '.' ':' '=' '+' '-' '|' '/' '\\' '~' '%' '&' '$'
             '!' '?' '<' '>' '^' 'v' 'o' 'O' '0' 'X' 'x')
 DRAW_CHAR_IDX=1
-TOOL="draw"     # draw, fill, line, box, ellipse, erase, copy
+TOOL="draw"     # draw, fill, line, polyline, box, ellipse, erase, copy
 GRID_ON=0
 LINE_START_X=-1
 LINE_START_Y=-1
+POLYLINE_LAST_X=-1
+POLYLINE_LAST_Y=-1
 BOX_START_X=-1
 BOX_START_Y=-1
 ELLIPSE_START_X=-1
@@ -96,6 +107,50 @@ REDO_COUNT=0
 # ============================================================================
 # Terminal setup
 # ============================================================================
+# ============================================================================
+# Viewport / terminal size
+# ============================================================================
+detect_terminal_size() {
+    local rows cols
+    rows=$(tput lines 2>/dev/null || echo 30)
+    cols=$(tput cols 2>/dev/null || echo 80)
+    VIEWPORT_W=$(( cols - 2 ))   # 1 col for right scrollbar + 1 padding
+    VIEWPORT_H=$(( rows - 4 ))   # 3 status bar lines + 1 padding
+    (( VIEWPORT_W > CANVAS_W )) && VIEWPORT_W=$CANVAS_W
+    (( VIEWPORT_H > CANVAS_H )) && VIEWPORT_H=$CANVAS_H
+    (( VIEWPORT_W < 10 )) && VIEWPORT_W=10
+    (( VIEWPORT_H < 5 )) && VIEWPORT_H=5
+}
+
+clamp_scroll() {
+    local max_sx=$(( CANVAS_W - VIEWPORT_W ))
+    local max_sy=$(( CANVAS_H - VIEWPORT_H ))
+    (( max_sx < 0 )) && max_sx=0
+    (( max_sy < 0 )) && max_sy=0
+    (( SCROLL_X < 0 )) && SCROLL_X=0
+    (( SCROLL_Y < 0 )) && SCROLL_Y=0
+    (( SCROLL_X > max_sx )) && SCROLL_X=$max_sx
+    (( SCROLL_Y > max_sy )) && SCROLL_Y=$max_sy
+}
+
+# Auto-scroll viewport to keep cursor visible
+follow_cursor() {
+    local margin=2
+    # Horizontal
+    if (( CUR_X < SCROLL_X + margin )); then
+        SCROLL_X=$(( CUR_X - margin ))
+    elif (( CUR_X >= SCROLL_X + VIEWPORT_W - margin )); then
+        SCROLL_X=$(( CUR_X - VIEWPORT_W + margin + 1 ))
+    fi
+    # Vertical
+    if (( CUR_Y < SCROLL_Y + margin )); then
+        SCROLL_Y=$(( CUR_Y - margin ))
+    elif (( CUR_Y >= SCROLL_Y + VIEWPORT_H - margin )); then
+        SCROLL_Y=$(( CUR_Y - VIEWPORT_H + margin + 1 ))
+    fi
+    clamp_scroll
+}
+
 enable_mouse() {
     printf '\e[?1000h'     # Enable basic mouse tracking (clicks)
     printf '\e[?1002h'     # Enable button-event tracking (drag)
@@ -113,6 +168,7 @@ setup_terminal() {
     printf '\e[?25l'       # Hide cursor
     printf '\e[?1049h'     # Alternate screen buffer
     printf '\e[2J'         # Clear screen
+    detect_terminal_size
     if (( MOUSE_ON )); then
         enable_mouse
     fi
@@ -152,6 +208,69 @@ init_canvas() {
     REDO_STACK=()
     UNDO_COUNT=0
     REDO_COUNT=0
+}
+
+# Resize canvas, preserving existing content
+resize_canvas() {
+    local new_w=$1 new_h=$2
+    (( new_w < 20 )) && new_w=20
+    (( new_h < 10 )) && new_h=10
+    (( new_w > 1000 )) && new_w=1000
+    (( new_h > 1000 )) && new_h=1000
+    if (( new_w == CANVAS_W && new_h == CANVAS_H )); then return; fi
+
+    # Clear undo/redo since snapshots are tied to the old dimensions
+    UNDO_STACK=(); REDO_STACK=(); UNDO_COUNT=0; REDO_COUNT=0
+
+    # Copy existing data
+    local -a old_char=("${CANVAS_CHAR[@]}")
+    local -a old_fg=("${CANVAS_FG[@]}")
+    local -a old_bg=("${CANVAS_BG[@]}")
+    local -a old_bold=("${CANVAS_BOLD[@]}")
+    local -a old_blink=("${CANVAS_BLINK[@]}")
+    local old_w=$CANVAS_W old_h=$CANVAS_H
+
+    CANVAS_W=$new_w
+    CANVAS_H=$new_h
+
+    # Reinitialize arrays
+    local total=$(( CANVAS_W * CANVAS_H ))
+    CANVAS_CHAR=()
+    CANVAS_FG=()
+    CANVAS_BG=()
+    CANVAS_BOLD=()
+    CANVAS_BLINK=()
+    for (( i=0; i<total; i++ )); do
+        CANVAS_CHAR[$i]=" "
+        CANVAS_FG[$i]=7
+        CANVAS_BG[$i]=0
+        CANVAS_BOLD[$i]=0
+        CANVAS_BLINK[$i]=0
+    done
+
+    # Copy old content that fits
+    local copy_w=$(( old_w < CANVAS_W ? old_w : CANVAS_W ))
+    local copy_h=$(( old_h < CANVAS_H ? old_h : CANVAS_H ))
+    for (( y=0; y<copy_h; y++ )); do
+        for (( x=0; x<copy_w; x++ )); do
+            local old_idx=$(( x + y * old_w ))
+            local new_idx=$(( x + y * CANVAS_W ))
+            CANVAS_CHAR[$new_idx]="${old_char[$old_idx]}"
+            CANVAS_FG[$new_idx]="${old_fg[$old_idx]}"
+            CANVAS_BG[$new_idx]="${old_bg[$old_idx]}"
+            CANVAS_BOLD[$new_idx]="${old_bold[$old_idx]}"
+            CANVAS_BLINK[$new_idx]="${old_blink[$old_idx]}"
+        done
+    done
+
+    # Clamp cursor
+    (( CUR_X >= CANVAS_W )) && CUR_X=$(( CANVAS_W - 1 ))
+    (( CUR_Y >= CANVAS_H )) && CUR_Y=$(( CANVAS_H - 1 ))
+    clamp_scroll
+    MODIFIED=1
+
+    # Clear and redraw
+    printf '\e[2J'
 }
 
 # Snapshot canvas state for undo
@@ -569,12 +688,23 @@ export_plain() {
 # Rendering
 # ============================================================================
 render_canvas() {
+    follow_cursor
     local buf=""
     buf+="\e[1;1H"  # Move to top-left
 
-    for (( y=0; y<CANVAS_H; y++ )); do
+    # Compute scrollbar positions
+    local max_sx=$(( CANVAS_W - VIEWPORT_W ))
+    local max_sy=$(( CANVAS_H - VIEWPORT_H ))
+    (( max_sx < 1 )) && max_sx=1
+    (( max_sy < 1 )) && max_sy=1
+    local vscroll_pos=$(( SCROLL_Y * (VIEWPORT_H - 1) / max_sy ))
+    local hscroll_pos=$(( SCROLL_X * (VIEWPORT_W - 1) / max_sx ))
+
+    for (( vy=0; vy<VIEWPORT_H; vy++ )); do
+        local y=$(( vy + SCROLL_Y ))
         local prev_fg=-1 prev_bg=-1 prev_bold=-1 prev_blink=-1
-        for (( x=0; x<CANVAS_W; x++ )); do
+        for (( vx=0; vx<VIEWPORT_W; vx++ )); do
+            local x=$(( vx + SCROLL_X ))
             local idx=$(( x + y * CANVAS_W ))
             local fg=${CANVAS_FG[$idx]}
             local bg=${CANVAS_BG[$idx]}
@@ -609,19 +739,17 @@ render_canvas() {
                     fi
                 fi
                 if (( in_sel )); then
-                    # Invert colors for selection
                     local tmp=$fg; fg=$bg; bg=$tmp
                 fi
             fi
 
             # Cursor
             if (( x == CUR_X && y == CUR_Y )); then
-                # Invert for cursor visibility
                 local tmp=$fg; fg=$bg; bg=$tmp
                 if (( bg == 0 && fg == 0 )); then fg=7; fi
             fi
 
-            # Only emit escape if attributes changed
+            # Emit escape if attributes changed
             if (( fg != prev_fg || bg != prev_bg || bd != prev_bold || bl != prev_blink )); then
                 buf+="\e[0"
                 (( bd )) && buf+=";1"
@@ -642,16 +770,35 @@ render_canvas() {
             buf+="$ch"
         done
         buf+="\e[0m"
-        if (( y < CANVAS_H - 1 )); then
+
+        # Right scrollbar (vertical)
+        if (( vy == vscroll_pos )); then
+            buf+="\e[0;97;44m#\e[0m"
+        else
+            buf+="\e[0;90m|\e[0m"
+        fi
+
+        if (( vy < VIEWPORT_H - 1 )); then
             buf+="\n"
         fi
     done
+
+    # Bottom scrollbar (horizontal) on next line
+    buf+="\n"
+    for (( vx=0; vx<VIEWPORT_W; vx++ )); do
+        if (( vx == hscroll_pos )); then
+            buf+="\e[0;97;44m#\e[0m"
+        else
+            buf+="\e[0;90m-\e[0m"
+        fi
+    done
+    buf+=" "  # corner
 
     printf '%b' "$buf"
 }
 
 render_status_bar() {
-    local row=$(( CANVAS_H + 1 ))
+    local row=$(( VIEWPORT_H + 2 ))  # After viewport + h-scrollbar
 
     # Status bar line 1 - tool & position info
     printf "\e[${row};1H\e[0;97;44m"
@@ -662,7 +809,8 @@ render_status_bar() {
     case "$TOOL" in
         draw)  tool_name="DRAW"  ;;
         fill)  tool_name="FILL"  ;;
-        line)  tool_name="LINE"  ;;
+        line)     tool_name="LINE"     ;;
+        polyline) tool_name="POLYLINE" ;;
         box)     tool_name="BOX"     ;;
         ellipse) tool_name="ELLIPSE" ;;
         erase)   tool_name="ERASE"   ;;
@@ -675,8 +823,8 @@ render_status_bar() {
     (( CUR_BLINK )) && attr+="K"
     [[ -z "$attr" ]] && attr="-"
 
-    printf " %-12s${mod_flag}| Pos:(%02d,%02d) | Char:[%s] | Attr:[%s] | " \
-        "$FILENAME" "$CUR_X" "$CUR_Y" "$CUR_CHAR" "$attr"
+    printf " %-12s${mod_flag}| Pos:(%03d,%03d) Canvas:%dx%d | Char:[%s] | Attr:[%s] | " \
+        "$FILENAME" "$CUR_X" "$CUR_Y" "$CANVAS_W" "$CANVAS_H" "$CUR_CHAR" "$attr"
 
     # Show foreground color swatch
     printf "FG:"
@@ -738,7 +886,7 @@ render_status_bar() {
     printf "\e[${row};1H\e[0;90;40m"
     local mouse_flag="ON"
     (( ! MOUSE_ON )) && mouse_flag="OFF"
-    printf " [H]elp [Space]Draw [Tab]Char [1]FG [2]BG [F]ill [L]ine [B]ox [I]ellipse [E]rase [U]ndo [S]ave [M]ouse:%s [Q]uit" "$mouse_flag"
+    printf " [H]elp [Space]Draw [1]FG [2]BG [F]ill [L]ine [K]polyline [B]ox [I]ellipse [E]rase [U]ndo [S]ave [M]ouse:%s [Q]uit" "$mouse_flag"
     printf "%*s\e[0m" 10 ""
 }
 
@@ -752,7 +900,7 @@ render_all() {
 # ============================================================================
 color_picker() {
     local mode=$1  # "fg" or "bg"
-    local row=$(( CANVAS_H + 1 ))
+    local row=$(( VIEWPORT_H + 2 ))
     printf "\e[${row};1H\e[0;97;41m"
     if [[ "$mode" == "fg" ]]; then
         printf " SELECT FOREGROUND COLOR (0-F, Esc to cancel): "
@@ -786,7 +934,7 @@ color_picker() {
 }
 
 char_picker() {
-    local row=$(( CANVAS_H + 1 ))
+    local row=$(( VIEWPORT_H + 2 ))
     printf "\e[${row};1H\e[0;97;42m"
     printf " CHARACTER PICKER - Press a key to select (Esc cancel): "
     printf "%*s\e[0m" 30 ""
@@ -825,7 +973,7 @@ char_picker() {
 prompt_filename() {
     local prompt_msg="$1"
     local default="$2"
-    local row=$(( CANVAS_H + 1 ))
+    local row=$(( VIEWPORT_H + 2 ))
     printf "\e[${row};1H\e[0;97;45m"
     printf " %s [%s]: " "$prompt_msg" "$default"
     printf "%*s\e[0m" 30 ""
@@ -874,10 +1022,11 @@ show_help() {
     ║              ANSI ART EDITOR - HELP                         ║
     ╠══════════════════════════════════════════════════════════════╣
     ║                                                              ║
-    ║  MOVEMENT                                                    ║
-    ║    Arrow Keys .... Move cursor                               ║
+    ║  MOVEMENT & SCROLLING                                        ║
+    ║    Arrow Keys .... Move cursor (viewport follows)           ║
     ║    Home/End ...... Start/end of row                          ║
-    ║    PgUp/PgDn ..... Top/bottom of canvas                     ║
+    ║    PgUp/PgDn ..... Scroll up/down by one page               ║
+    ║    + / - ......... Resize canvas (+/-10 each axis)          ║
     ║                                                              ║
     ║  DRAWING                                                     ║
     ║    Space ......... Place character with current colors       ║
@@ -896,6 +1045,7 @@ show_help() {
     ║  TOOLS                                                       ║
     ║    F ............. Flood fill tool                           ║
     ║    L ............. Line tool (click start, move, click end)  ║
+    ║    K ............. Polyline (continuous chained lines)       ║
     ║    B ............. Box/rectangle tool                        ║
     ║    I ............. Ellipse/oval tool (center, then edge)    ║
     ║    E ............. Eraser tool                               ║
@@ -939,13 +1089,19 @@ HELPEOF
 handle_mouse_action() {
     local mx=$1 my=$2 btn=$3 event=$4  # event: press, release, drag, wheel_up, wheel_down
 
+    # Check if click is on the color palette (status bar)
+    local palette_row=$(( VIEWPORT_H + 2 ))  # After viewport + h-scrollbar
+    if (( my == palette_row )); then
+        handle_palette_click "$mx"
+        return
+    fi
+
+    # Translate viewport coordinates to canvas coordinates
+    mx=$(( mx + SCROLL_X ))
+    my=$(( my + SCROLL_Y ))
+
     # Ignore clicks outside the canvas area
     if (( mx < 0 || mx >= CANVAS_W || my < 0 || my >= CANVAS_H )); then
-        # Check if click is on the color palette (status bar line 2)
-        local palette_row=$(( CANVAS_H + 1 ))  # 0-indexed row for palette
-        if (( my == palette_row )); then
-            handle_palette_click "$mx"
-        fi
         return
     fi
 
@@ -970,6 +1126,16 @@ handle_mouse_action() {
                         else
                             draw_line "$LINE_START_X" "$LINE_START_Y" "$CUR_X" "$CUR_Y"
                             LINE_START_X=-1; LINE_START_Y=-1
+                        fi
+                        ;;
+                    polyline)
+                        if (( POLYLINE_LAST_X < 0 )); then
+                            POLYLINE_LAST_X=$CUR_X
+                            POLYLINE_LAST_Y=$CUR_Y
+                        else
+                            draw_line "$POLYLINE_LAST_X" "$POLYLINE_LAST_Y" "$CUR_X" "$CUR_Y"
+                            POLYLINE_LAST_X=$CUR_X
+                            POLYLINE_LAST_Y=$CUR_Y
                         fi
                         ;;
                     box)
@@ -1050,10 +1216,16 @@ handle_mouse_action() {
             MOUSE_DRAGGING=0
             ;;
         wheel_up)
-            (( CUR_Y > 0 )) && (( CUR_Y-- ))
+            (( SCROLL_Y > 0 )) && (( SCROLL_Y -= 3 ))
+            (( CUR_Y > 0 )) && (( CUR_Y -= 3 ))
+            (( CUR_Y < 0 )) && CUR_Y=0
+            clamp_scroll
             ;;
         wheel_down)
-            (( CUR_Y < CANVAS_H - 1 )) && (( CUR_Y++ ))
+            (( SCROLL_Y += 3 ))
+            (( CUR_Y += 3 ))
+            (( CUR_Y >= CANVAS_H )) && CUR_Y=$(( CANVAS_H - 1 ))
+            clamp_scroll
             ;;
     esac
 }
@@ -1237,10 +1409,12 @@ handle_input() {
             CUR_X=$(( CANVAS_W - 1 ))
             ;;
         PGUP)
-            CUR_Y=0
+            (( CUR_Y -= VIEWPORT_H ))
+            (( CUR_Y < 0 )) && CUR_Y=0
             ;;
         PGDN)
-            CUR_Y=$(( CANVAS_H - 1 ))
+            (( CUR_Y += VIEWPORT_H ))
+            (( CUR_Y >= CANVAS_H )) && CUR_Y=$(( CANVAS_H - 1 ))
             ;;
         SPACE|ENTER)
             case "$TOOL" in
@@ -1258,6 +1432,18 @@ handle_input() {
                         draw_line "$LINE_START_X" "$LINE_START_Y" "$CUR_X" "$CUR_Y"
                         LINE_START_X=-1
                         LINE_START_Y=-1
+                    fi
+                    ;;
+                polyline)
+                    if (( POLYLINE_LAST_X < 0 )); then
+                        # First click sets starting point
+                        POLYLINE_LAST_X=$CUR_X
+                        POLYLINE_LAST_Y=$CUR_Y
+                    else
+                        # Draw from last point to current, then chain
+                        draw_line "$POLYLINE_LAST_X" "$POLYLINE_LAST_Y" "$CUR_X" "$CUR_Y"
+                        POLYLINE_LAST_X=$CUR_X
+                        POLYLINE_LAST_Y=$CUR_Y
                     fi
                     ;;
                 box)
@@ -1340,27 +1526,31 @@ handle_input() {
         [rR]|CTRL_Y) do_redo ;;
         [fF])
             TOOL="fill"
-            LINE_START_X=-1; BOX_START_X=-1; ELLIPSE_START_X=-1; SELECTING=0
+            LINE_START_X=-1; BOX_START_X=-1; ELLIPSE_START_X=-1; POLYLINE_LAST_X=-1; POLYLINE_LAST_Y=-1; SELECTING=0
             ;;
         [lL])
             TOOL="line"
-            LINE_START_X=-1; BOX_START_X=-1; ELLIPSE_START_X=-1; SELECTING=0
+            LINE_START_X=-1; BOX_START_X=-1; ELLIPSE_START_X=-1; POLYLINE_LAST_X=-1; POLYLINE_LAST_Y=-1; SELECTING=0
+            ;;
+        [kK])
+            TOOL="polyline"
+            LINE_START_X=-1; BOX_START_X=-1; ELLIPSE_START_X=-1; POLYLINE_LAST_X=-1; POLYLINE_LAST_Y=-1; SELECTING=0
             ;;
         [bB])
             TOOL="box"
-            LINE_START_X=-1; BOX_START_X=-1; ELLIPSE_START_X=-1; SELECTING=0
+            LINE_START_X=-1; BOX_START_X=-1; ELLIPSE_START_X=-1; POLYLINE_LAST_X=-1; POLYLINE_LAST_Y=-1; SELECTING=0
             ;;
         [iI])
             TOOL="ellipse"
-            LINE_START_X=-1; BOX_START_X=-1; ELLIPSE_START_X=-1; SELECTING=0
+            LINE_START_X=-1; BOX_START_X=-1; ELLIPSE_START_X=-1; POLYLINE_LAST_X=-1; POLYLINE_LAST_Y=-1; SELECTING=0
             ;;
         [eE])
             TOOL="erase"
-            LINE_START_X=-1; BOX_START_X=-1; ELLIPSE_START_X=-1; SELECTING=0
+            LINE_START_X=-1; BOX_START_X=-1; ELLIPSE_START_X=-1; POLYLINE_LAST_X=-1; POLYLINE_LAST_Y=-1; SELECTING=0
             ;;
         [cC])
             TOOL="copy"
-            LINE_START_X=-1; BOX_START_X=-1; ELLIPSE_START_X=-1; SELECTING=0
+            LINE_START_X=-1; BOX_START_X=-1; ELLIPSE_START_X=-1; POLYLINE_LAST_X=-1; POLYLINE_LAST_Y=-1; SELECTING=0
             COPY_START_X=-1; COPY_END_X=-1
             ;;
         [vV])
@@ -1368,7 +1558,7 @@ handle_input() {
             ;;
         [dD])
             TOOL="draw"
-            LINE_START_X=-1; BOX_START_X=-1; ELLIPSE_START_X=-1; SELECTING=0
+            LINE_START_X=-1; BOX_START_X=-1; ELLIPSE_START_X=-1; POLYLINE_LAST_X=-1; POLYLINE_LAST_Y=-1; SELECTING=0
             ;;
         [pP])
             # Eyedropper - pick color from current cell
@@ -1393,12 +1583,20 @@ handle_input() {
                 disable_mouse
             fi
             ;;
+        "+"|"=")
+            # Increase canvas size by 10 in each dimension (max 1000)
+            resize_canvas $(( CANVAS_W + 10 )) $(( CANVAS_H + 10 ))
+            ;;
+        "-"|"_")
+            # Decrease canvas size by 10 (min 20x10)
+            resize_canvas $(( CANVAS_W - 10 )) $(( CANVAS_H - 10 ))
+            ;;
         [hH]|"?")
             show_help
             ;;
         [qQ])
             if (( MODIFIED )); then
-                local row=$(( CANVAS_H + 1 ))
+                local row=$(( VIEWPORT_H + 2 ))
                 printf "\e[${row};1H\e[0;97;41m"
                 printf " Unsaved changes! Press Q again to quit, any other key to cancel. "
                 printf "%*s\e[0m" 20 ""
